@@ -106,6 +106,16 @@ namespace Dotnet.Script.Core
 
                 try
                 {
+                    // On macOS, AssemblyLoadContext.LoadFromAssemblyPath() opens each DLL file
+                    // via a SafeFileHandle (for mmap), then closes the fd. If GC.SuppressFinalize
+                    // was not called on those handles (a CLR bug path), their fd numbers get
+                    // recycled by the script's child processes (e.g. CliWrap's socketpairs).
+                    // When the finalizer eventually fires it closes the live socket → EADDRNOTAVAIL.
+                    // Forcing a full collection here drains those finalizers before any sockets
+                    // are created by user code.
+                    GC.Collect();
+                    GC.WaitForPendingFinalizers();
+                    GC.Collect();
                     var resultTask = (Task<TReturn>)method.Invoke(null, new[] { submissionStates });
                     return await resultTask;
                 }

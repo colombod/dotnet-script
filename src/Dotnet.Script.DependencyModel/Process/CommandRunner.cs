@@ -21,7 +21,14 @@ namespace Dotnet.Script.DependencyModel.Process
             _logger.Debug($"Executing '{commandPath} {arguments}'");
             var startInformation = CreateProcessStartInfo(commandPath, arguments, workingDirectory);
             using var process = CreateProcess(startInformation);
-            RunAndWait(process);
+            process.Start();
+            var stdoutTask = process.StandardOutput.ReadToEndAsync();
+            var stderrTask = process.StandardError.ReadToEndAsync();
+            process.WaitForExit();
+            var stdout = stdoutTask.GetAwaiter().GetResult();
+            var stderr = stderrTask.GetAwaiter().GetResult();
+            if (!string.IsNullOrWhiteSpace(stdout)) _logger.Debug(stdout);
+            if (!string.IsNullOrWhiteSpace(stderr)) _logger.Error(stderr);
             return process.ExitCode;
         }
 
@@ -60,31 +67,9 @@ namespace Dotnet.Script.DependencyModel.Process
         }
 
 
-        private static void RunAndWait(System.Diagnostics.Process process)
+        private static System.Diagnostics.Process CreateProcess(ProcessStartInfo startInformation)
         {
-            process.Start();
-            process.BeginErrorReadLine();
-            process.BeginOutputReadLine();
-            process.WaitForExit();
-        }
-        private System.Diagnostics.Process CreateProcess(ProcessStartInfo startInformation)
-        {
-            var process = new System.Diagnostics.Process { StartInfo = startInformation };
-            process.OutputDataReceived += (s, e) =>
-            {
-                if (!string.IsNullOrWhiteSpace(e.Data))
-                {
-                    _logger.Debug(e.Data);
-                }
-            };
-            process.ErrorDataReceived += (s, e) =>
-            {
-                if (!string.IsNullOrWhiteSpace(e.Data))
-                {
-                    _logger.Error(e.Data);
-                }
-            };
-            return process;
+            return new System.Diagnostics.Process { StartInfo = startInformation };
         }
     }
 
