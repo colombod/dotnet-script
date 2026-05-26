@@ -106,13 +106,23 @@ namespace Dotnet.Script.Core
 
                 try
                 {
-                    // On macOS, AssemblyLoadContext.LoadFromAssemblyPath() opens each DLL file
-                    // via a SafeFileHandle (for mmap), then closes the fd. If GC.SuppressFinalize
-                    // was not called on those handles (a CLR bug path), their fd numbers get
-                    // recycled by the script's child processes (e.g. CliWrap's socketpairs).
-                    // When the finalizer eventually fires it closes the live socket → EADDRNOTAVAIL.
-                    // Forcing a full collection here drains those finalizers before any sockets
-                    // are created by user code.
+                    // On macOS, LoadFromAssemblyPath() opens each DLL via a SafeFileHandle
+                    // (for mmap), then explicitly closes the fd. If GC.SuppressFinalize was
+                    // not called on those handles (a CLR bug path), the fd numbers are freed
+                    // but their finalizers remain pending. If a script child process (e.g.
+                    // CliWrap) creates socketpairs that recycle those fd numbers, the eventual
+                    // finalizer fires and closes the live socket → EADDRNOTAVAIL (errno 49).
+                    //
+                    // Two-part fix:
+                    // 1. Eagerly preload every runtime dependency so all LoadFromAssemblyPath()
+                    //    calls happen now (not lazily via the Resolving event during user code).
+                    // 2. Force a full GC cycle to drain all pending SafeFileHandle finalizers
+                    //    before any user code (and any socket creation) runs.
+                    foreach (var dep in runtimeDepsMap.Values)
+                    {
+                        try { assemblyLoadPal.LoadFrom(dep.Path); }
+                        catch (Exception) { }
+                    }
                     GC.Collect();
                     GC.WaitForPendingFinalizers();
                     GC.Collect();
