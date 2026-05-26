@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
@@ -22,13 +22,20 @@ namespace Dotnet.Script.DependencyModel.Process
             var startInformation = CreateProcessStartInfo(commandPath, arguments, workingDirectory);
             using var process = CreateProcess(startInformation);
             process.Start();
-            var stdoutTask = process.StandardOutput.ReadToEndAsync();
-            var stderrTask = process.StandardError.ReadToEndAsync();
-            process.WaitForExit();
-            var stdout = stdoutTask.GetAwaiter().GetResult();
-            var stderr = stderrTask.GetAwaiter().GetResult();
-            if (!string.IsNullOrWhiteSpace(stdout)) _logger.Debug(stdout);
-            if (!string.IsNullOrWhiteSpace(stderr)) _logger.Error(stderr);
+            if (startInformation.RedirectStandardOutput)
+            {
+                var stdoutTask = process.StandardOutput.ReadToEndAsync();
+                var stderrTask = process.StandardError.ReadToEndAsync();
+                process.WaitForExit();
+                var stdout = stdoutTask.GetAwaiter().GetResult();
+                var stderr = stderrTask.GetAwaiter().GetResult();
+                if (!string.IsNullOrWhiteSpace(stdout)) _logger.Debug(stdout);
+                if (!string.IsNullOrWhiteSpace(stderr)) _logger.Error(stderr);
+            }
+            else
+            {
+                process.WaitForExit();
+            }
             return process.ExitCode;
         }
 
@@ -37,20 +44,41 @@ namespace Dotnet.Script.DependencyModel.Process
             var startInformation = CreateProcessStartInfo(commandPath, arguments, workingDirectory);
             using var process = CreateProcess(startInformation);
             process.Start();
-            var stdoutTask = process.StandardOutput.ReadToEndAsync();
-            var stderrTask = process.StandardError.ReadToEndAsync();
-            process.WaitForExit();
-            return new CommandResult(process.ExitCode, stdoutTask.Result, stderrTask.Result);
+            string stdout, stderr;
+            if (startInformation.RedirectStandardOutput)
+            {
+                var stdoutTask = process.StandardOutput.ReadToEndAsync();
+                var stderrTask = process.StandardError.ReadToEndAsync();
+                process.WaitForExit();
+                stdout = stdoutTask.GetAwaiter().GetResult();
+                stderr = stderrTask.GetAwaiter().GetResult();
+            }
+            else
+            {
+                process.WaitForExit();
+                stdout = string.Empty;
+                stderr = string.Empty;
+            }
+            return new CommandResult(process.ExitCode, stdout, stderr);
         }
 
         private static ProcessStartInfo CreateProcessStartInfo(string commandPath, string arguments, string workingDirectory)
         {
+            // On Unix (macOS and Linux), anonymous pipes are backed by AF_UNIX socketpairs.
+            // The .NET runtime's async socket I/O engine (SocketAsyncEngine) registers those
+            // sockets in a static epoll/kqueue-based dispatcher. Even after Process.Dispose()
+            // the engine may hold socket references in its static state, preventing GC
+            // collection. If the same fd numbers are later recycled by a script child process
+            // (e.g. CliWrap), the stale engine state corrupts the new socket →
+            // EADDRNOTAVAIL (errno 49). Disabling redirection on Unix avoids creating the
+            // socketpairs entirely; subprocess output goes directly to the terminal instead.
+            bool redirect = IsWindows();
             var startInformation = new ProcessStartInfo($"{commandPath}")
             {
                 CreateNoWindow = true,
                 Arguments = arguments ?? "",
-                RedirectStandardOutput = true,
-                RedirectStandardError = true,
+                RedirectStandardOutput = redirect,
+                RedirectStandardError = redirect,
                 UseShellExecute = false,
                 WorkingDirectory = workingDirectory ?? System.Environment.CurrentDirectory
             };
@@ -58,6 +86,7 @@ namespace Dotnet.Script.DependencyModel.Process
             RemoveMsBuildEnvironmentVariables(startInformation.Environment);
             return startInformation;
         }
+
         private static void RemoveMsBuildEnvironmentVariables(IDictionary<string, string> environment)
         {
             // Remove various MSBuild environment variables set by OmniSharp to ensure that
@@ -66,6 +95,10 @@ namespace Dotnet.Script.DependencyModel.Process
             environment.Remove("MSBuildExtensionsPath");
         }
 
+        private static bool IsWindows()
+        {
+            return System.Runtime.InteropServices.RuntimeInformation.IsOSPlatform(System.Runtime.InteropServices.OSPlatform.Windows);
+        }
 
         private static System.Diagnostics.Process CreateProcess(ProcessStartInfo startInformation)
         {
@@ -89,7 +122,10 @@ namespace Dotnet.Script.DependencyModel.Process
         {
             if (ExitCode != success)
             {
-                throw new InvalidOperationException(StandardError);
+                var message = !string.IsNullOrEmpty(StandardError)
+                    ? StandardError
+                    : $"Command failed with exit code {ExitCode}. See console output for details.";
+                throw new InvalidOperationException(message);
             }
             return this;
         }

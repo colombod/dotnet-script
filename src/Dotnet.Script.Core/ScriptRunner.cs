@@ -107,25 +107,28 @@ namespace Dotnet.Script.Core
                 try
                 {
                     // On macOS, LoadFromAssemblyPath() opens each DLL via a SafeFileHandle
-                    // (for mmap), then explicitly closes the fd. If GC.SuppressFinalize was
-                    // not called on those handles (a CLR bug path), the fd numbers are freed
-                    // but their finalizers remain pending. If a script child process (e.g.
-                    // CliWrap) creates socketpairs that recycle those fd numbers, the eventual
-                    // finalizer fires and closes the live socket → EADDRNOTAVAIL (errno 49).
+                    // (for mmap), then explicitly closes the fd without calling
+                    // GC.SuppressFinalize (a CLR bug path). The fd numbers are freed but
+                    // their finalizers remain pending. If a script child process (e.g. CliWrap)
+                    // creates socketpairs that recycle those fd numbers, the eventual finalizer
+                    // fires and closes the live socket → EADDRNOTAVAIL (errno 49).
                     //
                     // Two-part fix:
                     // 1. Eagerly preload every runtime dependency so all LoadFromAssemblyPath()
                     //    calls happen now (not lazily via the Resolving event during user code).
                     // 2. Force a full GC cycle to drain all pending SafeFileHandle finalizers
                     //    before any user code (and any socket creation) runs.
+                    //
+                    // Note: subprocess I/O redirection (CommandRunner) uses a separate fix —
+                    // see CommandRunner.CreateProcessStartInfo() for the macOS-specific path.
                     foreach (var dep in runtimeDepsMap.Values)
                     {
                         try { assemblyLoadPal.LoadFrom(dep.Path); }
                         catch (Exception) { }
                     }
-                    GC.Collect();
+                    GC.Collect(GC.MaxGeneration, GCCollectionMode.Forced, blocking: true);
                     GC.WaitForPendingFinalizers();
-                    GC.Collect();
+                    GC.Collect(GC.MaxGeneration, GCCollectionMode.Forced, blocking: true);
                     var resultTask = (Task<TReturn>)method.Invoke(null, new[] { submissionStates });
                     return await resultTask;
                 }
