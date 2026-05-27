@@ -2,7 +2,6 @@ using System;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
-using System.Threading.Tasks;
 using Dotnet.Script.DependencyModel.Logging;
 
 namespace Dotnet.Script.DependencyModel.Process
@@ -22,20 +21,9 @@ namespace Dotnet.Script.DependencyModel.Process
             var startInformation = CreateProcessStartInfo(commandPath, arguments, workingDirectory);
             using var process = CreateProcess(startInformation);
             process.Start();
-            if (startInformation.RedirectStandardOutput)
-            {
-                var stdoutTask = process.StandardOutput.ReadToEndAsync();
-                var stderrTask = process.StandardError.ReadToEndAsync();
-                process.WaitForExit();
-                var stdout = stdoutTask.GetAwaiter().GetResult();
-                var stderr = stderrTask.GetAwaiter().GetResult();
-                if (!string.IsNullOrWhiteSpace(stdout)) _logger.Debug(stdout);
-                if (!string.IsNullOrWhiteSpace(stderr)) _logger.Error(stderr);
-            }
-            else
-            {
-                process.WaitForExit();
-            }
+            var (stdout, stderr) = ReadOutputSync(process, startInformation.RedirectStandardOutput);
+            if (!string.IsNullOrWhiteSpace(stdout)) _logger.Debug(stdout);
+            if (!string.IsNullOrWhiteSpace(stderr)) _logger.Error(stderr);
             return process.ExitCode;
         }
 
@@ -44,34 +32,39 @@ namespace Dotnet.Script.DependencyModel.Process
             var startInformation = CreateProcessStartInfo(commandPath, arguments, workingDirectory);
             using var process = CreateProcess(startInformation);
             process.Start();
-            string stdout, stderr;
-            if (startInformation.RedirectStandardOutput)
-            {
-                var stdoutTask = process.StandardOutput.ReadToEndAsync();
-                var stderrTask = process.StandardError.ReadToEndAsync();
-                process.WaitForExit();
-                stdout = stdoutTask.GetAwaiter().GetResult();
-                stderr = stderrTask.GetAwaiter().GetResult();
-            }
-            else
-            {
-                process.WaitForExit();
-                stdout = string.Empty;
-                stderr = string.Empty;
-            }
+            var (stdout, stderr) = ReadOutputSync(process, startInformation.RedirectStandardOutput);
             return new CommandResult(process.ExitCode, stdout, stderr);
+        }
+
+        private static (string stdout, string stderr) ReadOutputSync(System.Diagnostics.Process process, bool redirect)
+        {
+            if (!redirect)
+            {
+                process.WaitForExit();
+                return (string.Empty, string.Empty);
+            }
+            string stdout = null, stderr = null;
+            var stdoutThread = new System.Threading.Thread(() => stdout = process.StandardOutput.ReadToEnd());
+            var stderrThread = new System.Threading.Thread(() => stderr = process.StandardError.ReadToEnd());
+            stdoutThread.Start();
+            stderrThread.Start();
+            process.WaitForExit();
+            stdoutThread.Join();
+            stderrThread.Join();
+            return (stdout ?? string.Empty, stderr ?? string.Empty);
         }
 
         private static ProcessStartInfo CreateProcessStartInfo(string commandPath, string arguments, string workingDirectory)
         {
-            // On Unix (macOS and Linux), anonymous pipes are backed by AF_UNIX socketpairs.
-            // The .NET runtime's async socket I/O engine (SocketAsyncEngine) registers those
-            // sockets in a static epoll/kqueue-based dispatcher. Even after Process.Dispose()
-            // the engine may hold socket references in its static state, preventing GC
-            // collection. If the same fd numbers are later recycled by a script child process
-            // (e.g. CliWrap), the stale engine state corrupts the new socket →
-            // EADDRNOTAVAIL (errno 49). Disabling redirection on Unix avoids creating the
-            // socketpairs entirely; subprocess output goes directly to the terminal instead.
+            // On Unix, anonymous pipes are backed by AF_UNIX socketpairs. The .NET runtime's
+            // async socket I/O engine (SocketAsyncEngine) registers those fds in a static
+            // epoll/kqueue dispatcher — even synchronous reads are insufficient to prevent this
+            // because WaitForExit() internally drains redirected streams asynchronously in
+            // .NET 6+. After Process.Dispose() the OS recycles those fd numbers; if a script
+            // child process (e.g. CliWrap) reuses the same fds, the stale engine state corrupts
+            // the new socket → EADDRNOTAVAIL (errno 49). Disabling redirection on Unix avoids
+            // creating the socketpairs entirely. Callers suppress subprocess output noise by
+            // passing quiet verbosity flags to any dotnet commands they invoke.
             bool redirect = IsWindows();
             var startInformation = new ProcessStartInfo($"{commandPath}")
             {
@@ -87,17 +80,15 @@ namespace Dotnet.Script.DependencyModel.Process
             return startInformation;
         }
 
+        private static bool IsWindows() =>
+            System.Runtime.InteropServices.RuntimeInformation.IsOSPlatform(System.Runtime.InteropServices.OSPlatform.Windows);
+
         private static void RemoveMsBuildEnvironmentVariables(IDictionary<string, string> environment)
         {
             // Remove various MSBuild environment variables set by OmniSharp to ensure that
             // the .NET CLI is not launched with the wrong values.
             environment.Remove("MSBUILD_EXE_PATH");
             environment.Remove("MSBuildExtensionsPath");
-        }
-
-        private static bool IsWindows()
-        {
-            return System.Runtime.InteropServices.RuntimeInformation.IsOSPlatform(System.Runtime.InteropServices.OSPlatform.Windows);
         }
 
         private static System.Diagnostics.Process CreateProcess(ProcessStartInfo startInformation)
