@@ -29,38 +29,63 @@ namespace Dotnet.Script.DependencyModel.Process
 
         public CommandResult Capture(string commandPath, string arguments, string workingDirectory = null)
         {
-            var startInformation = CreateProcessStartInfo(commandPath, arguments, workingDirectory);
-            using var process = CreateProcess(startInformation);
-            process.Start();
-            var (stdout, stderr) = ReadOutputSync(process, startInformation.RedirectStandardOutput);
-
-            if (!startInformation.RedirectStandardOutput && process.ExitCode != 0)
+            if (!IsWindows())
             {
-                // On Unix, redirection is disabled to prevent EADDRNOTAVAIL. The command
-                // failed, so it is safe to retry with redirection to capture error details:
-                // no user script (and no CliWrap) will run after a failed restore —
-                // the caller will throw an exception that short-circuits execution.
-                return CaptureWithRedirect(commandPath, arguments, workingDirectory);
+                // On Unix, pipe redirection uses AF_UNIX socketpairs that persist in
+                // SocketAsyncEngine's static state, causing EADDRNOTAVAIL when a script's
+                // child process (e.g. CliWrap) later recycles the same fd numbers.
+                // Run via a shell script that redirects output to temp files instead —
+                // no socketpairs are created, and output is fully captured.
+                return CaptureViaShell(commandPath, arguments, workingDirectory);
             }
-            return new CommandResult(process.ExitCode, stdout, stderr);
-        }
-
-        private static CommandResult CaptureWithRedirect(string commandPath, string arguments, string workingDirectory)
-        {
-            var startInformation = new ProcessStartInfo(commandPath)
-            {
-                CreateNoWindow = true,
-                Arguments = arguments ?? "",
-                RedirectStandardOutput = true,
-                RedirectStandardError = true,
-                UseShellExecute = false,
-                WorkingDirectory = workingDirectory ?? System.Environment.CurrentDirectory
-            };
-            RemoveMsBuildEnvironmentVariables(startInformation.Environment);
+            var startInformation = CreateProcessStartInfo(commandPath, arguments, workingDirectory);
             using var process = CreateProcess(startInformation);
             process.Start();
             var (stdout, stderr) = ReadOutputSync(process, true);
             return new CommandResult(process.ExitCode, stdout, stderr);
+        }
+
+        private static CommandResult CaptureViaShell(string commandPath, string arguments, string workingDirectory)
+        {
+            var tmpStdout = Path.GetTempFileName();
+            var tmpStderr = Path.GetTempFileName();
+            var tmpScript = Path.GetTempFileName();
+            try
+            {
+                // Write a shell script that runs the command with file-based I/O redirection.
+                // This avoids anonymous pipe socketpairs entirely — the shell forks+execs the
+                // command with its stdout/stderr pointing at regular files, not AF_UNIX sockets.
+                File.WriteAllText(tmpScript,
+                    $"#!/bin/sh\n\"{commandPath}\" {arguments} >{tmpStdout} 2>{tmpStderr}\n");
+
+                var startInfo = new ProcessStartInfo("/bin/sh")
+                {
+                    Arguments = tmpScript,
+                    UseShellExecute = false,
+                    WorkingDirectory = workingDirectory ?? System.Environment.CurrentDirectory
+                };
+                RemoveMsBuildEnvironmentVariables(startInfo.Environment);
+
+                using var process = new System.Diagnostics.Process { StartInfo = startInfo };
+                process.Start();
+                process.WaitForExit();
+
+                return new CommandResult(
+                    process.ExitCode,
+                    File.ReadAllText(tmpStdout),
+                    File.ReadAllText(tmpStderr));
+            }
+            finally
+            {
+                TryDelete(tmpScript);
+                TryDelete(tmpStdout);
+                TryDelete(tmpStderr);
+            }
+        }
+
+        private static void TryDelete(string path)
+        {
+            try { File.Delete(path); } catch { }
         }
 
         private static (string stdout, string stderr) ReadOutputSync(System.Diagnostics.Process process, bool redirect)
