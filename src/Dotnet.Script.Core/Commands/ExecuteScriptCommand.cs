@@ -32,7 +32,6 @@ namespace Dotnet.Script.Core.Commands
             }
 
             var pathToLibrary = GetLibrary<TReturn>(options);
-
             var libraryOptions = new ExecuteLibraryCommandOptions(pathToLibrary, options.Arguments, options.CachePath, options.NoCache)
             {
 #if NETCOREAPP
@@ -64,12 +63,12 @@ namespace Dotnet.Script.Core.Commands
                 return pathToLibrary;
             }
 
-            var options = new PublishCommandOptions(executeOptions.File, executionCacheFolder, "script", PublishType.Library, executeOptions.OptimizationLevel, executeOptions.PackageSources, null, executeOptions.CachePath, executeOptions.NoCache)
-            {
-#if NETCOREAPP
-                AssemblyLoadContext = executeOptions.AssemblyLoadContext
-#endif
-            };
+            // AssemblyLoadContext is intentionally omitted here: the compile-to-DLL step needs only
+            // file metadata and the correct ALC is applied at execution time (ExecuteLibraryCommand).
+            // Passing it to PublishCommand forces all assembly references to be file-based
+            // MetadataReference objects instead of reusing already-loaded in-memory assemblies,
+            // which on macOS triggers EADDRNOTAVAIL in child processes started by the script.
+            var options = new PublishCommandOptions(executeOptions.File, executionCacheFolder, "script", PublishType.Library, executeOptions.OptimizationLevel, executeOptions.PackageSources, null, executeOptions.CachePath, executeOptions.NoCache);
             new PublishCommand(_scriptConsole, _logFactory).Execute<TReturn>(options);
             if (hash != null)
             {

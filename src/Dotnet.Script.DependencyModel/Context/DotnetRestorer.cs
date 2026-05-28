@@ -33,7 +33,11 @@ namespace Dotnet.Script.DependencyModel.Context
             _logger.Debug($"Restoring {projectFileInfo.Path} using the dotnet cli. RuntimeIdentifier : {runtimeIdentifier} NugetConfigFile: {projectFileInfo.NuGetConfigFile}");
 
             var commandPath = "dotnet";
-            var commandArguments = $"restore \"{projectFileInfo.Path}\" -r {runtimeIdentifier} {packageSourcesArgument} {configFileArgument}";
+            // Use quiet verbosity (-v q) so dotnet restore produces no stdout on success.
+            // On Unix, CommandRunner does not redirect subprocess I/O (to avoid EADDRNOTAVAIL
+            // caused by AF_UNIX socketpairs leaking into SocketAsyncEngine static state), so
+            // any subprocess stdout would flow directly to the parent process's stdout.
+            var commandArguments = $"restore \"{projectFileInfo.Path}\" -r {runtimeIdentifier} -v q {packageSourcesArgument} {configFileArgument}";
             var commandResult = _commandRunner.Capture(commandPath, commandArguments, workingDirectory);
             if (commandResult.ExitCode != 0)
             {
